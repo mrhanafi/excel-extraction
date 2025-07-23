@@ -1,0 +1,5 @@
+customer_name,order_id,amount,status
+John Doe,12345,99.99,Completed
+Jane Smith,12346,149.5,Pending
+Bob Johnson,12347,75.25,Shipped
+Alice Brown,12348,200.0,Processing

@@ -1,0 +1,4 @@
+Customer,Order Number,Total Amount,Order Status
+John Doe,12345,99.99,Completed
+Jane Smith,12346,149.5,Pending
+Bob Johnson,12347,75.25,Shipped
