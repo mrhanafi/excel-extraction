@@ -1,0 +1,608 @@
+from urllib.parse import quote_plus
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+import pandas as pd
+import io
+import json
+import os
+from io import BytesIO
+import uuid
+from datetime import datetime, timedelta, date
+import common_logger
+import common_reload_modules
+import osdu_csv_parser_helper
+import doria_helper
+import column_helper
+from typing import Dict, List, Tuple
+from azure.storage.blob import BlobClient, BlobProperties, BlobServiceClient, ContainerClient
+
+def process_csv_files(source_json_str, destination_json_str, file_pattern, get_payload_func):
+    """
+    Generalized function to process CSV files from Azure Blob Storage.
+    
+    Args:
+        source_json_str (str): JSON string containing source information
+        destination_json_str (str): JSON string containing destination information
+        file_pattern (str): File name pattern to match (e.g., 'AllocatedPerforation.csv')
+        get_payload_func (callable): Function reference to call for payload creation
+            The function should accept (file_source, file_metadata, viewer_acl, owner_acl, legal_tags, countries)
+    
+    Returns:
+        str: Log output of the process
+    """
+    source_info = json.loads(source_json_str)
+    destination_info = json.loads(destination_json_str)
+    common_reload_modules.reload(osdu_csv_parser_helper)
+
+    log_output = "Begin"
+    
+    try:
+        body_json_info = json.loads(destination_info["BodyJson"])
+        
+        client_id = body_json_info["ClientId"]
+        client_secret = body_json_info["ClientSecret"]
+        scope = body_json_info["Scope"]
+        
+        token_url = body_json_info["GetTokenUrl"]
+        validate_token_url = body_json_info["ValidateTokenUrl"]
+        base_url = destination_info["ApiUrl"]
+        
+        url_generate_signed_landing_url = f'{base_url}{body_json_info["GetSignedLandingUrl"]}'
+        metadata_url = f'{base_url}{body_json_info["MetadataCreationUrl"]}'
+        csv_parser_url = f'{base_url}{body_json_info["CsvParserApi"]}'
+        
+        workflow_url = f'{base_url}{body_json_info["WorkflowStatusUrl"]}'
+        b64_cred = osdu_csv_parser_helper.convert_credential_b64(client_id, client_secret)
+        
+        last_month_date = osdu_csv_parser_helper.get_target_date()
+        formatted_date = last_month_date.strftime("%Y%m")
+        log_output = common_logger.log(log_output, f"Start processing files for the month {formatted_date}")
+        
+        # Download blobs from Azure Storage
+        sas_url = source_info["SasUrl"]
+        container_client_sas = ContainerClient.from_container_url(container_url=sas_url)
+
+        base_path = "sor/doria"
+        all_blobs = container_client_sas.list_blobs(name_starts_with=base_path)
+
+        # Filter blobs that match our criteria
+        matching_blobs = [
+            blob for blob in all_blobs 
+            if (blob.name.endswith(file_pattern) and 
+                f"/{formatted_date}/" in blob.name or blob.name.endswith(f"/{formatted_date}"))
+        ]
+        
+        for blob in matching_blobs:
+            if blob.name.endswith(".csv"):
+                try:
+                    delfi_token = osdu_csv_parser_helper.get_delfi_token(token_url, scope, b64_cred)
+                    token_expiry = osdu_csv_parser_helper.validate_delfi_token(validate_token_url, delfi_token, scope)
+                    extracted_country = osdu_csv_parser_helper.extract_country(blob.name)
+
+                    log_output = common_logger.log(log_output, f"Blob is from country {extracted_country}")
+
+                    # Define list of countries to execute
+                    countries_to_execute = [extracted_country]
+                    #if extracted_country == "IRQ":
+                        #countries_to_execute.append("IRQ_INTERNATIONAL")
+
+                    # Process for each country in the list
+                    for country in countries_to_execute:
+                        log_output = common_logger.log(log_output, f"Processing for country {country}")
+
+                        url_result = osdu_csv_parser_helper.get_signed_landing_url(url_generate_signed_landing_url, delfi_token)
+                        landing_url = url_result["signed_url"]
+                        file_source = url_result["file_source"]
+
+                        # Get original filename from blob path
+                        original_filename = blob.name.split('/')[-1]  # Gets the last part of the path
+                        filename_without_ext = original_filename.rsplit('.', 1)[0]  # Remove extension
+                        current_date = datetime.now().strftime("%Y_%m_%d")
+
+                        # Download blob
+                        blob_client = container_client_sas.get_blob_client(blob=blob.name)
+                        base_csv_name = os.path.basename(blob.name)
+                        log_output = common_logger.log(log_output, f"Downloading {blob.name}")
+
+                        # Download to file
+                        blob_data = blob_client.download_blob()
+                        csv_bytes = BytesIO(blob_data.readall())
+
+                        # Upload to signed landing zone
+                        file_upload_rsp = osdu_csv_parser_helper.upload_csv(landing_url, csv_bytes)
+                        file_metadata = osdu_csv_parser_helper.get_file_metadata(base_csv_name, csv_bytes)
+
+                        # Get legal metadata for the country
+                        legal_metadata = osdu_csv_parser_helper.get_legal_metadata(country)
+                        log_output = common_logger.log(log_output, f"Legal metadata for {country}:\n{json.dumps(legal_metadata, indent=4)}")
+
+                        # Call the appropriate payload function passed as parameter
+                        payload = get_payload_func(
+                            file_source, file_metadata, 
+                            legal_metadata["viewer_acl"], legal_metadata["owner_acl"],
+                            legal_metadata["legal_tags"], legal_metadata["countries"]
+                        )
+
+                        # Create metadata and prepare to parse csv file
+                        file_id = osdu_csv_parser_helper.create_file_metadata(metadata_url, delfi_token, payload)
+
+                        # Trigger the CSV parser
+                        initiation_output = osdu_csv_parser_helper.initiate_csv_parser(csv_parser_url, delfi_token, file_id)
+
+                        # Check workflow status
+                        workflow_response = osdu_csv_parser_helper.check_run_status(workflow_url, initiation_output["run_id"], delfi_token)
+                        log_output = osdu_csv_parser_helper.print_info(log_output, file_id, initiation_output["correlation_id"], initiation_output["run_id"], workflow_response)
+
+                except Exception as e:
+                    log_output = common_logger.log(log_output, f"Error occurred when processing csv file due to: {str(e)}")
+
+    except Exception as e:
+        log_output = common_logger.log(log_output, str(e), True)
+        
+    finally:
+        log_output = common_logger.log(log_output, "Finished")
+        return log_output
+
+SOURCE_PATH = "iuploader/process-engineering/operation-data/doria"
+DESTINATION_PATH = "sor/doria"
+
+SPECIAL_CASE_SHEETS = {
+    "Choke Change",
+    "Daily Inj Well Status (Water)",
+    "Daily Inj Well Status (Gas)",
+}
+
+MONTH_MAPPING = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+}
+
+def process_excel_file(
+    blob: BlobProperties,
+    src_container_client,
+    dst_blob_service_client,
+    country_name: str
+) -> str:
+    """Process a single Excel file and upload the results."""
+    log_output = ""
+    extracted_time = extract_date(blob)
+    
+    log_output = common_logger.log(log_output, f"Processing blob folder ({country_name}): {blob.name}")
+    og_blob_client = src_container_client.get_blob_client(blob)
+    collected_sheets = read_and_extract(og_blob_client)
+
+    # Upload processed data
+    log_output = common_logger.log(
+        log_output, 
+        f"Uploading data as CSV to {DESTINATION_PATH}/{country_name.lower()}/{extracted_time}/"
+    )
+    
+    for table_name, df in collected_sheets.items():
+        container_client = dst_blob_service_client.get_container_client(
+            f"{DESTINATION_PATH}/{country_name.lower()}/{extracted_time}"
+        )
+        upload_dataframe_as_csv(df, table_name, container_client)
+        log_output = common_logger.log(
+            log_output, 
+            f"Uploaded table {table_name} as {table_name}.csv"
+        )
+    
+    return log_output
+
+def upload_dataframe_as_csv(df: pd.DataFrame, table_name: str, container_client) -> None:
+    """Upload a DataFrame as CSV to blob storage."""
+    csv_buffer = io.BytesIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_buffer.seek(0)
+    container_client.upload_blob(name=f"{table_name}.csv", data=csv_buffer, overwrite=True)
+
+def read_and_extract(blob_client: BlobClient) -> Dict[str, pd.DataFrame]:
+    """Read and extract data from Excel file."""
+    blob_data = blob_client.download_blob().readall()
+    excel_file = pd.ExcelFile(io.BytesIO(blob_data))
+    
+    validate_sheets_exist(excel_file)
+    collected_sheets = {}
+
+    for sheet_name in excel_file.sheet_names:
+        if sheet_name not in doria_helper.DATA_ENTITY_SCHEMA:
+            print(f"Sheet name '{sheet_name}' not recognised.")
+            continue
+            
+        print(f"Processing sheet: {sheet_name}")
+        df = process_sheet(excel_file, sheet_name)
+        
+        if not df.empty:
+            df["ResourceSecurityClassification"] = "INTERNAL USE"
+            table_name = doria_helper.DATA_ENTITY_SCHEMA[sheet_name]["name"]
+            collected_sheets[table_name] = df
+
+    return collected_sheets
+
+def validate_sheets_exist(excel_file: pd.ExcelFile) -> None:
+    """Validate that all required sheets exist in the Excel file."""
+    missing_sheets = set(doria_helper.DATA_ENTITY_SCHEMA.keys()) - set(excel_file.sheet_names)
+    if missing_sheets:
+        raise ValueError(f"Missing required sheets: {missing_sheets}")
+
+def process_sheet(excel_file: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
+    """Process a single sheet from the Excel file."""
+    df = pd.read_excel(excel_file, sheet_name=sheet_name, skiprows=4)
+    df.columns = df.columns.str.strip()
+    df = transform_sheet_headers(df, sheet_name)
+    
+    if df.empty:
+        return df
+
+    validate_sheet_columns(df, sheet_name)
+    df.columns = [get_column_from_schema(col, sheet_name) for col in df.columns]
+    
+    return df
+
+def transform_sheet_headers(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    """Transform sheet headers based on template requirements."""
+    additional_headers = df.loc[0].tolist()
+    columns_to_replace = df.columns.tolist() if sheet_name not in SPECIAL_CASE_SHEETS else additional_headers
+    
+    # Process column names
+    processed_columns = process_column_names(columns_to_replace)
+    
+    # Add additional header information if needed
+    if sheet_name not in SPECIAL_CASE_SHEETS:
+        processed_columns = add_additional_headers(processed_columns, additional_headers, sheet_name)
+    
+    df.columns = processed_columns
+    return df.iloc[1:].reset_index(drop=True)
+
+def process_column_names(columns: List[str]) -> List[str]:
+    """Process column names to clean them up."""
+    processed = []
+    previous_header = ""
+    
+    for header in columns:
+        if isinstance(header, str):
+            # Remove numeric suffixes and clean up the header
+            if "." in header:
+                header = header.rsplit(".", 1)[0]
+            header = header.rstrip().replace("\n", "")
+            
+            # Handle unnamed columns
+            if "Unnamed:" in header:
+                header = previous_header
+            
+            header = header.replace("YYYY-MM-DDT00:00:00Z", "")
+            previous_header = header
+        
+        processed.append(header)
+    return processed
+
+def add_additional_headers(columns: List[str], additional_headers: List[str], sheet_name: str) -> List[str]:
+    """Add additional header information to columns."""
+    for i, header in enumerate(additional_headers):
+        if isinstance(header, str):
+            header = header.strip().replace("\n", "")
+            if sheet_name == "Well Test":
+                if header in ["Result No", "Comments"]:
+                    columns[i] = header
+                    continue
+            columns[i] = f"{columns[i].strip()} {header}"
+    return columns
+
+def validate_sheet_columns(df: pd.DataFrame, sheet_name: str) -> None:
+    """Validate sheet columns against schema."""
+    expected_count = len(doria_helper.DATA_ENTITY_SCHEMA[sheet_name]["columns"].keys())
+    if len(df.columns) != expected_count:
+        raise ValueError(
+            f"Sheet '{sheet_name}' has mismatched columns count. "
+            f"Expected: {expected_count}, Actual: {len(df.columns)}"
+        )
+
+def get_column_from_schema(col: str, sheet_name: str) -> str:
+    """Map column names to schema names."""
+    normalized_col = col.replace(" ", "").lower()
+    for schema_col, details in doria_helper.DATA_ENTITY_SCHEMA[sheet_name]["columns"].items():
+        if details["display_name"].replace(" ", "").lower() == normalized_col:
+            return schema_col
+    return col
+
+def extract_date(blob: BlobProperties) -> str:
+    """Extract date from blob metadata or filename."""
+    if "PE-IA Production Data_" not in blob.name:
+        return blob.creation_time.strftime("%Y%m")
+        
+    name_part = blob.name.split("PE-IA Production Data_")[-1][:5]
+    month = MONTH_MAPPING.get(name_part[:3].lower())
+    year = int("20" + name_part[3:5])
+    
+    return datetime(year=year, month=month, day=1).strftime("%Y%m")
+
+def main(src_str: str, dst_str: str, parameters = None) -> str:
+    """
+    Event-based main function to process a specific Excel file, upload as CSVs,
+    and then process these CSVs through the OSDU parser.
+    
+    Args:
+        src_str (str): JSON string containing source information
+        dst_str (str): JSON string containing destination information
+        parameters (list): Parameters passed by the caller, including the full blob path of the Excel file
+        
+    Returns:
+        str: Log output of the process
+    """
+    log_output = "Begin"
+    try:
+        common_reload_modules.reload(column_helper, doria_helper, osdu_csv_parser_helper)
+        
+        # Validate parameters
+        if not parameters or not isinstance(parameters, list) or len(parameters) == 0 or 'FileName' not in parameters[0]:
+            log_output = common_logger.log(log_output, "Error: No Excel file path provided in parameters")
+            return log_output
+            
+        # Get the full blob path from parameters
+        full_blob_path = parameters[0]['FileName']
+        log_output = common_logger.log(log_output, f"Processing Excel file: {full_blob_path}")
+        
+        # Initialize clients
+        src_container_client = doria_helper.get_blob_service_container_client_from(src_str)
+        src_json = json.loads(src_str)
+        dst_blob_service_client = BlobServiceClient(src_json["SasUrl"])
+        
+        # Extract directory, country name from the full blob path
+        directory, country_name, _ = doria_helper.raw_extract_path(full_blob_path)
+        
+        if not country_name:
+            log_output = common_logger.log(log_output, f"Error: Could not extract country name from path: {full_blob_path}")
+            return log_output
+            
+        # Verify the blob exists
+        try:
+            blob_client = src_container_client.get_blob_client(blob=full_blob_path)
+            blob_properties = blob_client.get_blob_properties()
+        except Exception as e:
+            log_output = common_logger.log(log_output, f"Error: Excel file not found or not accessible: {full_blob_path}. Error: {str(e)}")
+            return log_output
+            
+        # Step 1: Process the Excel file and convert to CSVs
+        try:
+            excel_process_result = process_excel_file_by_path(
+                full_blob_path, 
+                src_container_client, 
+                dst_blob_service_client, 
+                country_name
+            )
+            
+            log_output = common_logger.log(log_output, excel_process_result["log_output"])
+            generated_csv_files = excel_process_result["generated_files"]
+            extracted_time = excel_process_result["extracted_time"]
+            
+            log_output = common_logger.log(log_output, f"Successfully generated {len(generated_csv_files)} CSV files")
+            
+        except Exception as e:
+            raise ValueError(f"Error processing Excel file {full_blob_path}: {str(e)}\nLog: {log_output}")
+        
+        # Step 2: Process each generated CSV file through OSDU parser
+        if generated_csv_files:
+            log_output = common_logger.log(log_output, "Starting to process generated CSV files through OSDU parser")
+            
+            # Get OSDU API details from destination info
+            destination_info = json.loads(dst_str)
+            
+            # Initialize payload function mappings - map table names to payload functions
+            csv_payload_functions = {
+                "AllocatedPerforation": osdu_csv_parser_helper.get_allocated_perforation_payload,
+                "AllocatedWellInjWell": osdu_csv_parser_helper.get_injection_well_allocation_payload,
+                "AllocatedWellProdWell": osdu_csv_parser_helper.get_production_well_allocation_payload,
+                "ChokeChange": osdu_csv_parser_helper.get_choke_change_payload,
+                "DailyInjWellStatusGas": osdu_csv_parser_helper.get_daily_gas_injwell_status_payload,
+                "DailyInjWellStatusWater": osdu_csv_parser_helper.get_daily_water_injwell_status_payload,
+                "DailyProdWellStatusGas": osdu_csv_parser_helper.get_daily_gas_prodwell_status_payload,
+                "DailyProdWellStatusOil": osdu_csv_parser_helper.get_daily_oil_prodwell_status_payload,
+                "FGSProcessData": osdu_csv_parser_helper.get_fgs_process_data_payload,
+                "FGSSurveyData": osdu_csv_parser_helper.get_fgs_survey_data_payload,
+                "SGSProcessData": osdu_csv_parser_helper.get_sgs_process_data_payload,
+                "SGSSurveyData": osdu_csv_parser_helper.get_sgs_survey_payload,
+                "WellTest": osdu_csv_parser_helper.get_well_test_payload
+            }
+            
+            # Process each generated CSV file
+            processed_files_count = 0
+            for csv_info in generated_csv_files:
+                table_name = csv_info["table_name"]
+                csv_path = f"{DESTINATION_PATH}/{country_name.lower()}/{extracted_time}/{table_name}.csv"
+                
+                if table_name not in csv_payload_functions:
+                    log_output = common_logger.log(log_output, f"Warning: No payload function defined for table {table_name}, skipping")
+                    continue
+                
+                try:
+                    # Process this CSV file through OSDU parser
+                    process_result = process_single_csv(
+                        src_str, 
+                        dst_str, 
+                        csv_path,
+                        csv_payload_functions[table_name],
+                        country_name
+                    )
+                    
+                    log_output = common_logger.log(log_output, process_result)
+                    processed_files_count += 1
+                    
+                except Exception as e:
+                    log_output = common_logger.log(log_output, f"Error processing CSV {csv_path}: {str(e)}")
+            
+            log_output = common_logger.log(log_output, f"Successfully processed {processed_files_count} out of {len(generated_csv_files)} CSV files")
+                
+    except Exception as e:
+        log_output = common_logger.log(log_output, f"Error in main function: {str(e)}", True)
+        raise
+    finally:
+        log_output = common_logger.log(log_output, "Finished")
+        return log_output
+
+
+def process_excel_file_by_path(
+    blob_path: str,
+    src_container_client,
+    dst_blob_service_client,
+    country_name: str
+) -> dict:
+    """
+    Process a single Excel file by path and upload the results as CSVs.
+    
+    Args:
+        blob_path (str): The full path of the Excel blob
+        src_container_client (ContainerClient): Source container client
+        dst_blob_service_client (BlobServiceClient): Destination blob service client
+        country_name (str): Country name extracted from the blob path
+        
+    Returns:
+        dict: Contains log output, generated file info, and extracted time
+    """
+    log_output = ""
+    generated_files = []
+    
+    # Get the blob client
+    blob_client = src_container_client.get_blob_client(blob=blob_path)
+    blob_properties = blob_client.get_blob_properties()
+    
+    # Extract date from the blob path or use creation time
+    if "PE-IA Production Data_" not in blob_path:
+        extracted_time = blob_properties.creation_time.strftime("%Y%m")
+    else:
+        name_part = blob_path.split("PE-IA Production Data_")[-1][:5]
+        month = MONTH_MAPPING.get(name_part[:3].lower())
+        year = int("20" + name_part[3:5])
+        extracted_time = datetime(year=year, month=month, day=1).strftime("%Y%m")
+    
+    log_output = common_logger.log(log_output, f"Processing blob ({country_name}): {blob_path}")
+    
+    # Read and extract sheets from the Excel file
+    collected_sheets = read_and_extract(blob_client)
+
+    # Prepare destination path
+    destination_path = f"{DESTINATION_PATH}/{country_name.lower()}/{extracted_time}"
+    
+    log_output = common_logger.log(
+        log_output, 
+        f"Uploading data as CSV to {destination_path}/"
+    )
+    
+    # Ensure destination container exists
+    try:
+        dst_blob_service_client.create_container(destination_path)
+    except Exception:
+        # Container might already exist, which is fine
+        pass
+        
+    container_client = dst_blob_service_client.get_container_client(destination_path)
+    
+    # Upload each sheet as a CSV file
+    for table_name, df in collected_sheets.items():
+        upload_dataframe_as_csv(df, table_name, container_client)
+        
+        # Record information about the generated file
+        generated_files.append({
+            "table_name": table_name,
+            "row_count": len(df)
+        })
+        
+        log_output = common_logger.log(
+            log_output, 
+            f"Uploaded table {table_name} as {table_name}.csv"
+        )
+    
+    return {
+        "log_output": log_output,
+        "generated_files": generated_files,
+        "extracted_time": extracted_time
+    }
+
+
+def process_single_csv(src_str, dst_str, csv_path, get_payload_func, country_name):
+    """
+    Process a single CSV file through the OSDU parser.
+    
+    Args:
+        src_str (str): JSON string containing source information
+        dst_str (str): JSON string containing destination information
+        csv_path (str): Full path to the CSV file in blob storage
+        get_payload_func (callable): Function to generate payload for this CSV type
+        country_name (str): Country name for the data
+        
+    Returns:
+        str: Log output from processing
+    """
+    log_output = f"Processing CSV: {csv_path}"
+    
+    try:
+        source_info = json.loads(src_str)
+        destination_info = json.loads(dst_str)
+        
+        # Get body JSON info
+        body_json_info = json.loads(destination_info["BodyJson"])
+        
+        # Setup credentials and API endpoints
+        client_id = body_json_info["ClientId"]
+        client_secret = body_json_info["ClientSecret"]
+        scope = body_json_info["Scope"]
+        
+        token_url = body_json_info["GetTokenUrl"]
+        validate_token_url = body_json_info["ValidateTokenUrl"]
+        base_url = destination_info["ApiUrl"]
+        
+        url_generate_signed_landing_url = f'{base_url}{body_json_info["GetSignedLandingUrl"]}'
+        metadata_url = f'{base_url}{body_json_info["MetadataCreationUrl"]}'
+        csv_parser_url = f'{base_url}{body_json_info["CsvParserApi"]}'
+        workflow_url = f'{base_url}{body_json_info["WorkflowStatusUrl"]}'
+        
+        # Get credentials and token
+        b64_cred = osdu_csv_parser_helper.convert_credential_b64(client_id, client_secret)
+        delfi_token = osdu_csv_parser_helper.get_delfi_token(token_url, scope, b64_cred)
+        token_expiry = osdu_csv_parser_helper.validate_delfi_token(validate_token_url, delfi_token, scope)
+        
+        # Get source container client
+        container_client_sas = ContainerClient.from_container_url(container_url=source_info["SasUrl"])
+        
+        # Download the CSV file
+        blob_client = container_client_sas.get_blob_client(blob=csv_path)
+        log_output = common_logger.log(log_output, f"Downloading {csv_path}")
+        blob_data = blob_client.download_blob()
+        csv_bytes = BytesIO(blob_data.readall())
+        
+        # Get signed landing URL
+        url_result = osdu_csv_parser_helper.get_signed_landing_url(url_generate_signed_landing_url, delfi_token)
+        landing_url = url_result["signed_url"]
+        file_source = url_result["file_source"]
+        
+        # Upload to signed landing zone
+        file_upload_rsp = osdu_csv_parser_helper.upload_csv(landing_url, csv_bytes)
+        
+        # Get file metadata
+        base_csv_name = os.path.basename(csv_path)
+        file_metadata = osdu_csv_parser_helper.get_file_metadata(base_csv_name, csv_bytes)
+        
+        # Get legal metadata for the country
+        legal_metadata = osdu_csv_parser_helper.get_legal_metadata(country_name)
+        log_output = common_logger.log(log_output, f"Legal metadata for {country_name}:\n{json.dumps(legal_metadata, indent=4)}")
+        
+        # Generate payload
+        payload = get_payload_func(
+            file_source, file_metadata, 
+            legal_metadata["viewer_acl"], legal_metadata["owner_acl"],
+            legal_metadata["legal_tags"], legal_metadata["countries"]
+        )
+        
+        # Create metadata and prepare to parse CSV file
+        file_id = osdu_csv_parser_helper.create_file_metadata(metadata_url, delfi_token, payload)
+        
+        # Trigger the CSV parser
+        initiation_output = osdu_csv_parser_helper.initiate_csv_parser(csv_parser_url, delfi_token, file_id)
+        
+        # Check workflow status
+        workflow_response = osdu_csv_parser_helper.check_run_status(workflow_url, initiation_output["run_id"], delfi_token)
+        log_output = osdu_csv_parser_helper.print_info(log_output, file_id, initiation_output["correlation_id"], initiation_output["run_id"], workflow_response)
+        
+    except Exception as e:
+        log_output = common_logger.log(log_output, f"Error processing CSV file: {str(e)}")
+    
+    return log_output
