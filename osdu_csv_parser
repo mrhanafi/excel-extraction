@@ -1,0 +1,2093 @@
+#below is the code to include required libraries, please check and add libraries at Administration > Settings > Python > Python Modules
+import json
+import base64
+import requests
+import os
+from datetime import datetime, timedelta, date
+import common_logger
+from io import BytesIO
+
+def get_target_date():
+    # Get the first day of current month
+    first_day_current = date.today().replace(day=1)
+
+    # Subtract one day to get last day of previous month
+    last_day_previous = first_day_current - timedelta(days=1)
+
+    # Get first day of previous month
+    first_day_previous = last_day_previous.replace(day=1)
+    
+    #first_day_previous = date(2024,11,1)
+    
+    return first_day_previous
+
+def print_info(log_output, file_id, correlation_id, run_id, status_response):
+    json_to_print = {
+        "file_id": file_id,
+        "correlation_id": correlation_id,
+        "run_id": run_id,
+        "status_response": status_response
+    }
+    
+    log_output = common_logger.log(log_output, f"Logging required informations:\n{json.dumps(json_to_print, indent=4)}")
+    return log_output
+
+def extract_country(file_path):
+    components = file_path.split('/')
+    extracted_country = ""
+    
+    if len(components) >= 3:
+        extracted_country = components[2].upper()
+        
+    return extracted_country
+
+def convert_credential_b64(client_id, client_secret):
+    client_id_n_secret = f'{client_id}:{client_secret}'
+    raw_bytes = client_id_n_secret.encode()
+    b64_bytes = base64.urlsafe_b64encode(raw_bytes)
+    b64_string = b64_bytes.decode()
+    
+    return b64_string
+
+def get_delfi_token(url, scope, auth_b64_string):
+    payload=f'grant_type=client_credentials&scope={scope}'
+    
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': f'Basic {auth_b64_string}'
+    }
+
+    response = requests.post(url, headers=headers, data=payload)
+    json_response = json.loads(response.text)
+    access_token = json_response["access_token"]
+    return access_token
+
+def validate_delfi_token(url, token, scope):
+    payload = {
+        "token": token,
+        "audience": scope
+    }
+
+    headers = {
+        'Content-Type': 'application/json'
+    }
+
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+   
+    json_response = json.loads(response.text)
+    pretty_response = json.dumps(response.json(), indent=4, sort_keys=True)
+    token_expiry_epoch = json_response["exp"]
+
+    return token_expiry_epoch
+
+def get_signed_landing_url(url, token, data_partition_id='petronas-osdu'):
+    # Define API details
+    headers = {'accept': 'application/json',  
+               'data-partition-id': data_partition_id,  
+               'Content-Type': 'application/json',  
+               'Authorization': 'Bearer '+ token}
+
+    # Make the GET request
+    response = requests.get(url, headers=headers)
+    
+    result = {}
+
+    # Check the response
+    if response.status_code == 200:
+        # Parse the JSON response
+        response_data = response.json()
+        result['signed_url'] = response_data["Location"]["SignedURL"]
+        result['file_source'] = response_data["Location"]["FileSource"]
+    else:
+        raise Exception(f"Failed to get signed url, status code: {response.status_code}, response: {response.text}")
+        
+    return result
+
+def upload_csv(signed_url, file_data):
+    # Prepare headers for the PUT request
+    headers = {
+        'x-ms-blob-type': 'BlockBlob',  # Required for Azure Blob Storage
+        'Content-Type': 'text/csv'     # Ensure the content type matches your file type
+    }
+    
+    if isinstance(file_data, BytesIO):
+        data = file_data.getvalue()
+    else:
+        data = file_data
+
+    response = requests.put(signed_url, headers=headers, data=data)
+
+    # Check the response
+    if response.status_code == 201:
+        print("File uploaded successfully!")
+    else:
+        raise Exception(f"Failed to upload csv to signed url, status code: {response.status_code}, response: {response.text}")
+        
+    return response
+
+def get_file_metadata(filename, file_data):
+    file_metadata = {}
+    
+    # Get current timestamp
+    current_time = datetime.now().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+    
+    # If file_data is BytesIO or bytes, get its size
+    if isinstance(file_data, BytesIO):
+        file_size = len(file_data.getvalue())
+    elif isinstance(file_data, bytes):
+        file_size = len(file_data)
+    else:
+        file_size = len(file_data)
+    
+    file_metadata = {
+        'file_name': filename,
+        'file_size': file_size,
+        'time_created': current_time,
+        'time_updated': current_time
+    }
+    
+    return file_metadata
+
+def create_file_metadata(api_url, token, payload, correlation_id=None, data_partition_id='petronas-osdu'):
+    headers = {
+        'accept': 'application/json',  
+        'data-partition-id': data_partition_id,  
+        'Content-Type': 'application/json',  
+        'Authorization': 'Bearer '+ token
+    }
+    
+    # Only add correlation-id to headers if it's provided
+    if correlation_id:
+        headers['correlation-id'] = correlation_id
+    
+    # Make the POST request to create metadata
+    response = requests.post(api_url, headers=headers, json=payload)
+    # Check the response
+    if response.status_code == 201:
+        file_id = response.json().get("id")
+    else:
+        raise Exception(f"Failed to create metadata. status code: {response.status_code}, response: {response.text}")
+    
+    return file_id
+
+def initiate_csv_parser(csv_parser_url, token, file_id, data_partition_id='petronas-osdu'):
+    output = {}
+    
+    # Headers for the API request
+    headers = {
+        'accept': 'application/json',  
+        'data-partition-id': data_partition_id,  
+        'Content-Type': 'application/json',  
+        'Authorization': 'Bearer '+ token
+    }
+
+    payload = {
+        "executionContext": {
+            "dataPartitionId": data_partition_id, 
+            "id": file_id
+        }
+    }
+
+    response = requests.post(csv_parser_url, headers=headers, json=payload)
+
+    # Check the response
+    if response.status_code == 200:
+        output['run_id'] = response.json().get("runId")
+        output['correlation_id'] = response.headers.get("correlation-id")
+    else:
+        raise Exception(f"Failed to initiate CSV Parser. status code: {response.status_code}, response: {response.text}")
+    
+    return output
+
+def check_run_status(base_url, run_id, token, data_partition_id='petronas-osdu'):
+    combined_url = f"{base_url}/{run_id}"
+    
+    header = {
+        "Authorization": f"Bearer {token}",
+        "data-partition-id": data_partition_id
+    }
+    
+    # Send the GET request
+    response = requests.get(combined_url, headers=header)
+
+    # Check if the response is successful
+    response.raise_for_status()
+    return response.json()
+
+def get_legal_metadata(country):
+    legal_metadatas = {
+        "MYS": {
+            "viewer_acl": ["data.dm-pj-c07a689f-88d5-4c7b-aa66-a4e5781664cf.viewers@petronas-lab-azure.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-c07a689f-88d5-4c7b-aa66-a4e5781664cf.owners@petronas-lab-azure.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-lab-azure-MY-Confidential-NPD-FPD-Unknown-EAR99-Unknown"],
+            "countries": ["MY"]
+        },
+        "BRA": {
+            "viewer_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.viewers@petronas-osdu.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.owners@petronas-osdu.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-osdu-1-1FR1NJZ-First-Party-Data-BR-Confidential-EAR99"],
+            "countries": ["BR"]
+        },
+        "VNM": {
+            "viewer_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.viewers@petronas-osdu.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.owners@petronas-osdu.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-osdu-1-1FR1NJZ-First-Party-Data-VN-Confidential-EAR99"],
+            "countries": ["VN"]
+        },
+        "IRQ": {
+            "viewer_acl": ["data.dm-pj-9dafc35e-7834-40e0-a566-d915afa5a0ee.viewers@petronas-osdu.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-9dafc35e-7834-40e0-a566-d915afa5a0ee.owners@petronas-osdu.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-osdu-1-1FR1NJZ-First-Party-Data-IQ-Confidential-EAR99"],
+            "countries": ["IQ"]
+        },
+        "IRQ_INTERNATIONAL": {
+            "viewer_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.viewers@petronas-osdu.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.owners@petronas-osdu.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-osdu-1-1FR1NJZ-First-Party-Data-IQ-Confidential-EAR99"],
+            "countries": ["IQ"]
+        },
+        "TKM": {
+            "viewer_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.viewers@petronas-osdu.enterprisedata.slb.com"],
+            "owner_acl": ["data.dm-pj-a18ed00f-0c89-43cf-8d8a-e957a924dc01.owners@petronas-osdu.enterprisedata.slb.com"],
+            "legal_tags": ["petronas-osdu-1-1FR1NJZ-First-Party-Data-TM-Confidential-EAR99"],
+            "countries": ["TM"]
+        },
+    }
+    
+    return legal_metadatas[country]
+
+def get_allocated_perforation_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:perforation_allocation:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Well": {
+                                "targetKind": "osdu:wks:master-data--Well:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELL_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Wellbore": {
+                                "targetKind": "osdu:wks:master-data--Wellbore:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELLBORE_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_NET_OIL_VOL",
+                                "ALLOC_COND_VOL",
+                                "ALLOC_WATER_VOL",
+                                "ALLOC_WATER_INJ_VOL",
+                                "ALLOC_NET_OIL_VOL_TTD",
+                                "ALLOC_NET_OIL_VOL_YTD",
+                                "ALLOC_COND_VOL_TTD",
+                                "ALLOC_COND_VOL_YTD",
+                                "ALLOC_WATER_VOL_TTD",
+                                "ALLOC_WATER_VOL_YTD",
+                                "ALLOC_WATER_INJ_VOL_TTD",
+                                "ALLOC_WATER_INJ_VOL_YTD"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_GAS_VOL",
+                                "ALLOC_GAS_INJ_VOL",
+                                "ALLOC_GAS_VOL_TTD",
+                                "ALLOC_GAS_VOL_YTD",
+                                "ALLOC_GAS_INJ_VOL_TTD",
+                                "ALLOC_GAS_INJ_VOL_YTD"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_injection_well_allocation_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:well_allocation_injwell:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_WATER_INJ_VOL",
+                                "THEOR_WATER_INJ_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_GAS_INJ_VOL",
+                                "THEOR_GAS_INJ_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_production_well_allocation_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:well_allocation_prodwell:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Well": {
+                                "targetKind": "osdu:wks:master-data--Well:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELL_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_GAS_RATE",
+                                "THEOR_CO2_RATE",
+                                "THEOR_GL_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_GAS_VOL",
+                                "ALLOC_GL_VOL",
+                                "ALLOC_CO2_VOL",
+                                "ALLOC_NET_GAS_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_NET_OIL_RATE",
+                                "THEOR_COND_RATE",
+                                "THEOR_WATER_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "ALLOC_NET_OIL_VOL",
+                                "ALLOC_COND_VOL",
+                                "ALLOC_WATER_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_choke_change_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:choke_change:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_GAS_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_COND_RATE",
+                                "THEOR_OIL_RATE",
+                                "Z_OIL_RATE",
+                                "THEOR_WAT_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "WH_PRESS",
+                                "BH_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "WH_TEMP",
+                                "BH_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE",
+                                "PRODUCTION_DAY"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_sgs_survey_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:sgs_survey:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.3048,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft\",\"baseMeasurement\":{\"ancestry\":\"L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_MD",
+                                "GAUGE_TVDSS",
+                                "DEPTH_DF",
+                                "DEPTH_THF",
+                                "DEPTH_WATER",
+                                "DEPTH_MIDPERF_THF",
+                                "MIDPERF_MDTHF",
+                                "MIDPERF_MD",
+                                "MIDPERF_TVDDF",
+                                "MIDPERF_TVDSS",
+                                "LAST_SURVEY_DEPTH",
+                                "DATUM_TVDSS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_PRESS",
+                                "LAST_SURVEY_PRESS",
+                                "MIDPERF_PRESS",
+                                "DATUM_PRESS",
+                                "THP",
+                                "CHP",
+                                "AVG_SITHP",
+                                "AVG_PCP",
+                                "FHTP_START",
+                                "FTHP_END",
+                                "PCP_START",
+                                "PCP_END",
+                                "TOP_GAUGE_MAX_PRESS",
+                                "BOTTOM_GAUGE_MAX_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degF",
+                            "persistableReference": "{\"abcd\":{\"a\":2298.35,\"b\":5.0,\"c\":9.0,\"d\":0.0},\"symbol\":\"degF\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_TEMP",
+                                "TOP_GAUGE_MAX_TEMP",
+                                "BOTTOM_GAUGE_MAX_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.000196644768,\"d\":0.0},\"symbol\":\"psi/ft\",\"baseMeasurement\":{\"ancestry\":\"M/L2T2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "DEPTH_SURVEY_GRAD",
+                                "PRESS_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "SURVEY_END_DATE",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_daily_oil_prodwell_status_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:daily_oil_prodwell_status:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_TEMP",
+                                "AVG_BH_TEMP",
+                                "Z_FLT",
+                                "WH_TEMP",
+                                "BH_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_PRESS",
+                                "AVG_BH_PRESS",
+                                "AVG_GL_MF_PRESS",
+                                "AVG_GL_PRESS",
+                                "AVG_WH_USC_PRESS",
+                                "Z_ITHP",
+                                "Z_FTHP",
+                                "Z_STHP",
+                                "Z_FLP",
+                                "Z_PCP",
+                                "Z_ICP",
+                                "Z_SCP",
+                                "Z_CCP",
+                                "WH_PRESS",
+                                "BH_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_OIL_RATE",
+                                "AVG_WATER_RATE",
+                                "THEOR_OIL_VOL",
+                                "THEOR_COND_VOL",
+                                "THEOR_WATER_VOL",
+                                "ALLOC_OIL_VOL",
+                                "ALLOC_COND_VOL",
+                                "ALLOC_WATER_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_GAS_RATE",
+                                "AVG_GL_RATE",
+                                "THEOR_GAS_VOL",
+                                "THEOR_GL_VOL",
+                                "ALLOC_GAS_VOL",
+                                "ALLOC_GL_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_OIL_RATE",
+                                "Z_OIL_RATE",
+                                "THEOR_WAT_RATE",
+                                "THEOR_COND_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_GAS_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE",
+                                "PRODUCTION_DAY"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_daily_gas_prodwell_status_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:daily_gas_prodwell_status:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Well": {
+                                "targetKind": "osdu:wks:master-data--Well:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELL_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Wellbore": {
+                                "targetKind": "osdu:wks:master-data--Wellbore:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELLBORE_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_TEMP",
+                                "AVG_BH_TEMP",
+                                "Z_FLT",
+                                "WH_TEMP",
+                                "BH_TEMP",
+                                "Z_FTHT"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_PRESS",
+                                "AVG_BH_PRESS",
+                                "AVG_GL_MF_PRESS",
+                                "AVG_GL_PRESS",
+                                "Z_ITHP",
+                                "Z_FTHP",
+                                "Z_STHP",
+                                "Z_FLP",
+                                "Z_PCP",
+                                "Z_ICP",
+                                "Z_SCP",
+                                "Z_CCP",
+                                "WH_PRESS",
+                                "BH_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "cmH2O[4degC]",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":98.0638,\"c\":1.0,\"d\":0.0},\"symbol\":\"cmH2O[4degC]\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_USC_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "cm3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":1e-06,\"c\":1.0,\"d\":0.0},\"symbol\":\"cm3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_OIL_RATE",
+                                "AVG_GL_RATE",
+                                "THEOR_OIL_VOL",
+                                "THEOR_GL_VOL",
+                                "ALLOC_OIL_VOL",
+                                "ALLOC_GL_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_GAS_RATE",
+                                "THEOR_GAS_VOL",
+                                "ALLOC_GAS_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WATER_RATE",
+                                "THEOR_COND_VOL",
+                                "THEOR_WATER_VOL",
+                                "ALLOC_COND_VOL",
+                                "ALLOC_WATER_VOL",
+                                "AVG_COND_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_OIL_RATE",
+                                "Z_OIL_RATE",
+                                "THEOR_WAT_RATE",
+                                "THEOR_COND_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_GAS_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE",
+                                "PRODUCTION_DAY"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_daily_gas_injwell_status_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:daily_gas_injwell_status:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "INJ_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft3\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_GAS_RATE",
+                                "ALLOC_INJ_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_TEMP",
+                                "AVG_BH_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_PRESS",
+                                "AVG_BH_PRESS",
+                                "ANNULUS_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_daily_water_injwell_status_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:daily_water_injwell_status:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "INJ_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":1.0,\"d\":0.0},\"symbol\":\"bbl\",\"baseMeasurement\":{\"ancestry\":\"L3\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "THEOR_WATER_RATE",
+                                "ALLOC_INJ_VOL"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_ANNULUS_PRESS",
+                                "AVG_WH_PRESS",
+                                "Z_SHUTIN_PRESS",
+                                "Z_FLP",
+                                "AVG_BH_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "AVG_WH_TEMP",
+                                "AVG_BH_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_fgs_survey_data_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:fgs_survey:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.3048,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft\",\"baseMeasurement\":{\"ancestry\":\"L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_MD",
+                                "GAUGE_TVDSS",
+                                "DEPTH_DF",
+                                "DEPTH_THF",
+                                "DEPTH_WATER",
+                                "DEPTH_MIDPERF_THF",
+                                "MIDPERF_MDTHF",
+                                "MIDPERF_MD",
+                                "MIDPERF_TVDDF",
+                                "MIDPERF_TVDSS",
+                                "LAST_SURVEY_DEPTH",
+                                "DATUM_TVDSS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_PRESS",
+                                "LAST_SURVEY_PRESS",
+                                "MIDPERF_PRESS",
+                                "DATUM_PRESS",
+                                "THP",
+                                "CHP",
+                                "FLP",
+                                "AVG_SITHP",
+                                "AVG_PCP",
+                                "FHTP_START",
+                                "FTHP_END",
+                                "PCP_START",
+                                "PCP_END",
+                                "TOP_GAUGE_MAX_PRESS",
+                                "BOTTOM_GAUGE_MAX_PRESS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degF",
+                            "persistableReference": "{\"abcd\":{\"a\":2298.35,\"b\":5.0,\"c\":9.0,\"d\":0.0},\"symbol\":\"degF\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAUGE_TEMP",
+                                "TOP_GAUGE_MAX_TEMP",
+                                "BOTTOM_GAUGE_MAX_TEMP"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.000196644768,\"d\":0.0},\"symbol\":\"psi/ft\",\"baseMeasurement\":{\"ancestry\":\"M/L2T2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "PRESS_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "LIQUID_RATE",
+                                "OIL_RATE",
+                                "WATER_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "GAS_RATE",
+                                "GL_LIFT_RATE"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "%",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.01,\"c\":1.0,\"d\":0.0},\"symbol\":\"%\",\"baseMeasurement\":{\"ancestry\":\"1\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "BSW"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "DAYTIME",
+                                "SURVEY_END_DATE",
+                                "WT_START_DATE",
+                                "WT_END_DATE",
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_fgs_process_data_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:fgs_process:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.3048,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft\",\"baseMeasurement\":{\"ancestry\":\"L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "MDWLTHF",
+                                "MD",
+                                "TVDDF",
+                                "TVDSS"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_PRESS",
+                                "PRESS",
+                                "PRESS_FORMATTED"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degF",
+                            "persistableReference": "{\"abcd\":{\"a\":2298.35,\"b\":5.0,\"c\":9.0,\"d\":0.0},\"symbol\":\"degF\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_TEMP",
+                                "TEMP",
+                                "TEMP_FORMATTED"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.000196644768,\"d\":0.0},\"symbol\":\"psi/ft\",\"baseMeasurement\":{\"ancestry\":\"M/L2T2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_PRESS_GRAD",
+                                "PRESS_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "deltaF/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":5.0,\"c\":2.7432,\"d\":0.0},\"symbol\":\"deltaF/ft\",\"baseMeasurement\":{\"ancestry\":\"D/L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_TEMP_GRAD",
+                                "TEMP_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_sgs_process_data_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:sgs_process:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.3048,\"c\":1.0,\"d\":0.0},\"symbol\":\"ft\",\"baseMeasurement\":{\"ancestry\":\"L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "MD",
+                                "TVDDF",
+                                "TVDSS",
+                                "NEGATIVE_MD"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_PRESS",
+                                "PRESS",
+                                "PRESS_FORMATTED"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degF",
+                            "persistableReference": "{\"abcd\":{\"a\":2298.35,\"b\":5.0,\"c\":9.0,\"d\":0.0},\"symbol\":\"degF\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_TEMP",
+                                "TEMP",
+                                "TEMP_FORMATTED"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.000196644768,\"d\":0.0},\"symbol\":\"psi/ft\",\"baseMeasurement\":{\"ancestry\":\"M/L2T2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_PRESS_GRAD",
+                                "PRESS_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "deltaF/ft",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":5.0,\"c\":2.7432,\"d\":0.0},\"symbol\":\"deltaF/ft\",\"baseMeasurement\":{\"ancestry\":\"D/L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOP_GAUGE_TEMP_GRAD",
+                                "TEMP_GRAD"
+                            ]
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DAT\", \"format\": \"dd/MM/yyyy\"}",
+                            "propertyNames": [
+                                "CREATED_DATE",
+                                "LAST_UPDATED_DATE"
+                            ]
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
+
+def get_well_test_payload(file_source, file_metadata, viewer_acls, owner_acls, legal_tags, countries):
+    file_name = file_metadata['file_name']
+    file_size = file_metadata['file_size']
+    time_created = file_metadata['time_created']
+    time_updated = file_metadata['time_updated']
+    
+    payload = {
+        "data": {
+            "Endian": "BIG",
+                "Description": "File ingestion for type : csv",
+                "DatasetProperties": {
+                "FileSourceInfo": {
+                    "FileSource": file_source,
+                    "Name": file_name,
+                    "FileSize": file_size
+                }
+            },
+            "ExtensionProperties": {
+                "Classification": f"Raw File ingestion for file {file_name}",
+                "Description": "This is the ingestion for file format csv",
+                "FileDateCreated": time_created,
+                "FileDateModified": time_updated,
+                "FileContentsDetails": {
+                    "TargetKind": "petronas:raw:well_test:1.0.0",
+                    "FileType": "csv",
+                    "relatedNaturalKey": [
+                        {
+                            "GeoPoliticalEntity": {
+                                "targetKind": "osdu:wks:master-data--GeoPoliticalEntity:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "COUNTRY",
+                                        "targetAttribute": "GeoPoliticalEntityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Field": {
+                                "targetKind": "osdu:wks:master-data--Field:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "FIELD_NAME",
+                                        "targetAttribute": "FieldName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Well": {
+                                "targetKind": "osdu:wks:master-data--Well:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELL_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "Wellbore": {
+                                "targetKind": "osdu:wks:master-data--Wellbore:1.*.*",
+                                "keys": [
+                                    {
+                                        "sourceColumn": "WELLBORE_NAME",
+                                        "targetAttribute": "FacilityName"
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                    "FrameOfReference": [
+                        {
+                            "kind": "Unit",
+                            "name": "h",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":3600.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"h\",\"baseMeasurement\":{\"ancestry\":\"T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TEST_DURATION"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "psi",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":4.4482216152605,\"c\":0.00064516,\"d\":0.0},\"symbol\":\"psi\",\"baseMeasurement\":{\"ancestry\":\"M/LT2\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_SEP_PRESS",
+                                "WH_PRESS",
+                                "ANNULUS_PRESS",
+                                "WH_USC_PRESS",
+                                "WH_DSC_PRESS",
+                                "GL_PRESS"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "degC",
+                            "persistableReference": "{\"abcd\":{\"a\":273.15,\"b\":1.0,\"c\":1.0,\"d\":0.0},\"symbol\":\"degC\",\"baseMeasurement\":{\"ancestry\":\"K\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_SEP_TEMP",
+                                "WH_TEMP",
+                                "ANNULUS_TEMP",
+                                "WH_USC_TEMP",
+                                "WH_DSC_TEMP"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":86400.0,\"d\":0.0},\"symbol\":\"ft3/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_TOTAL_GLR",
+                                "GL_RATE",
+                                "Z_TOTAL_GAS",
+                                "Z_GAS_RATE",
+                                "GAS_RATE_ADJ"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "in",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.0254,\"c\":1.0,\"d\":0.0},\"symbol\":\"in\",\"baseMeasurement\":{\"ancestry\":\"L\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_ORIFICE_SIZE_GL",
+                                "Z_ORIFICE_SIZE_GAS"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/d",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":86400.0,\"d\":0.0},\"symbol\":\"bbl/d\",\"baseMeasurement\":{\"ancestry\":\"L3/T\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "TOT_WATER_RATE_ADJ",
+                                "NET_COND_RATE_ADJ",
+                                "NET_OIL_RATE_ADJ",
+                                "LIQUID_RATE_ADJ"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "ft3/bbl",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.028316846592,\"c\":0.158987294928,\"d\":0.0},\"symbol\":\"ft3/bbl\",\"baseMeasurement\":{\"ancestry\":\"1\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_FGOR",
+                                "Z_IGLR",
+                                "Z_TGLR"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "1E-6 bbl/ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":28316.846592,\"d\":0.0},\"symbol\":\"1E-6 bbl/ft3\",\"baseMeasurement\":{\"ancestry\":\"1\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "Z_GUF"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "Unit",
+                            "name": "bbl/ft3",
+                            "persistableReference": "{\"abcd\":{\"a\":0.0,\"b\":0.158987294928,\"c\":0.028316846592,\"d\":0.0},\"symbol\":\"bbl/ft3\",\"baseMeasurement\":{\"ancestry\":\"1\",\"type\":\"UM\"},\"type\":\"UAD\"}",
+                            "propertyNames": [
+                                "WATERCUT_PCT",
+                                "WGR",
+                                "CGR"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DTM\", \"format\": \"yyyy-MM-ddTHH:mm:ssZ\"}",
+                            "propertyNames": [
+                                "START_DATE"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        },
+                        {
+                            "kind": "DateTime",
+                            "persistableReference": "{\"type\": \"DTM\", \"format\": \"yyyy/MM/ddTHH:mm:ssZ\"}",
+                            "propertyNames": [
+                                "END_DATE",
+                                "VALID_FROM_DATE",
+                                "CREATED_DATE"
+                            ],
+                            "propertyValues": [],
+                            "uncertainty": 0
+                        }
+                    ],
+                    "nestedFieldDelimiter": ".",
+                    "SpatialMapping": {}
+                }
+            },
+            "Name": file_name
+        },
+        "meta": None,
+        "kind": "osdu:wks:dataset--File.Generic:1.0.0",
+        "acl": {
+            "viewers": viewer_acls,
+            "owners": owner_acls
+        },
+        "legal": {
+            "legaltags": legal_tags,
+            "otherRelevantDataCountries": countries,
+            "status": "compliant"
+        }
+    }
+    
+    return payload
