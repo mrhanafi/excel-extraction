@@ -1,0 +1,2941 @@
+import re
+import io
+import json
+import common_logger
+import column_helper
+import odbc_driver_version
+import urllib.parse
+import pandas as pd
+import numpy as np
+import time
+import osdu_mapping_helper
+from datetime import datetime
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from sqlalchemy import create_engine, Engine, types
+from urllib.parse import quote_plus
+
+
+# Convert column name to upper and replace whitespace with underscore
+def standardize_column_format(df: pd.DataFrame,
+                              custom_naming: dict[str,
+                                                  str] = {}) -> pd.DataFrame:
+    df.columns = [transform_column_name(x, custom_naming) for x in df.columns]
+    return df
+
+
+def transform_column_name(name: str,
+                          custom_naming: dict[str, str] = {}) -> str:
+    return (custom_naming[name] if name in custom_naming else "".join(
+        map(str.capitalize, re.split(r"[\s_]", name))))
+
+
+def place_column_next_to(df: pd.DataFrame, next_to: str, col_name: str):
+    columns = df.columns.tolist()
+    val = columns.pop(columns.index(col_name))
+    order_index = columns.index(next_to) + 1
+    columns.insert(order_index, val)
+    return df[columns]
+
+
+def place_columns_next_to(df: pd.DataFrame, columns_next_to: list[tuple[str,
+                                                                        str]]):
+    columns = df.columns.tolist()
+    for next_to, col_name in columns_next_to:
+        val = columns.pop(columns.index(col_name))
+        order_index = columns.index(next_to) + 1
+        columns.insert(order_index, val)
+    return df[columns]
+
+
+def translate_datatype(datatype: str):
+    match datatype:
+        case "NUMBER":
+            return types.FLOAT
+        case "STRING":
+            return types.VARCHAR
+        case "DATE":
+            return types.DATE
+        case _:
+            raise ValueError(f"Unsupported data datatype: {datatype}")
+
+
+def raw_extract_path(path_str: str) -> tuple[str, str, str]:
+    return path_str.rsplit("/", 2)
+
+
+def raw_try_get_unique_path(container_client: ContainerClient,
+                            path_str: str,
+                            max_retry=10) -> (BlobClient, str):
+    retry = 0
+    new_output_path = path_str
+    while retry < max_retry:
+        blob_client = container_client.get_blob_client(new_output_path)
+        if blob_client.exists():
+            retry += 1
+            new_output_path = path_str.replace(".parquet", f"_{retry}.parquet")
+            continue
+        else:
+            return blob_client, new_output_path
+
+
+def insert_uom_columns(
+        df: pd.DataFrame, uom_columns: list[tuple[str, str | None,
+                                                  str]]) -> pd.DataFrame:
+    for col, col_uom, unit in uom_columns:
+        if not isinstance(col_uom, str):
+            col_uom = col + "_UOM"
+        df[col_uom] = unit
+    df = place_columns_next_to(
+        df,
+        [(col, col_uom if isinstance(col_uom, str) else col + "_UOM")
+         for col, col_uom, _ in uom_columns],
+    )
+    return df
+
+
+def get_mssql_engine_from(json_str: str) -> Engine:
+    json_data = json.loads(json_str)
+
+    MSSQL_SERVER = json_data["Server"]
+    MSSQL_DATABASE = json_data["Database"]
+    MSSQL_USERNAME = json_data["Username"]
+    MSSQL_PASSWORD = quote_plus(json_data["Password"])
+
+    MSSQL_CONNECTION_STRING = (
+        f"mssql+pyodbc://{MSSQL_USERNAME}:{MSSQL_PASSWORD}@{MSSQL_SERVER}/{MSSQL_DATABASE}"
+        f"?driver=ODBC+Driver+{odbc_driver_version.odbc_driver_version()}+for+SQL+Server"
+        "&TrustServerCertificate=yes")
+    return create_engine(MSSQL_CONNECTION_STRING, isolation_level="AUTOCOMMIT")
+
+
+def get_blob_service_container_client_from(json_str: str) -> ContainerClient:
+    json_data = json.loads(json_str)
+    account_name = json_data["AccountName"]
+    sas_token = json_data["SasToken"]
+    container_name = json_data["DefaultContainer"]
+
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{account_name}.blob.core.windows.net",
+        credential=sas_token,
+    )
+    return blob_service_client.get_container_client(container_name)
+
+
+# Blob management needs to duplicate file with new name, and then only delete the old one.
+def rename_blob(new_blob_name: str, ori_blob_client: BlobClient,
+                container_client: ContainerClient) -> None:
+    new_blob_client = container_client.get_blob_client(new_blob_name)
+    new_blob_client.start_copy_from_url(ori_blob_client.url)
+
+    # Wait for the copy operation to complete
+    props = new_blob_client.get_blob_properties()
+    while props.copy.status == "pending":
+        props = new_blob_client.get_blob_properties()
+
+    # Delete the original blob
+    ori_blob_client.delete_blob()
+
+
+def ensure_datatype(
+        df: pd.DataFrame,
+        entity_datatype: dict[str, tuple[any, bool]]) -> pd.DataFrame:
+    for col, (dtype, nullable) in entity_datatype.items():
+        if not nullable and df[col].isnull().any():
+            raise ValueError(f"Column {col} cannot be null")
+        if dtype is not None:
+            match dtype:
+                case types.VARCHAR:
+                    df[~df[col].isna()][col] = df[~df[col].isna()][col].astype(
+                        str)
+                case types.INT:
+                    df[col] = df[col].astype(int)
+                case types.FLOAT | types.DOUBLE:
+                    df[col] = df[col].astype(float)
+                case types.DATETIME | types.DATE:
+                    df[col] = df[col].astype(str)
+                    df[col] = pd.to_datetime(df[col], format="mixed")
+                case _:
+                    raise ValueError(f"Unsupported datatype: {dtype}")
+    return df
+
+
+def standardize_osdu_mapping(
+        mapping_df: pd.DataFrame, df: pd.DataFrame,
+        osdu_mapping_list: list[tuple[str, str, str, str]]) -> pd.DataFrame:
+    if len(osdu_mapping_list) == 0:
+        return df
+
+    standardized_list = [(x if len(x) == 4 else
+                          (x[0], x[1], x[2], None) if len(x) == 4 else
+                          (x[0], x[1], None, None)) for x in osdu_mapping_list]
+    for ref_table, sor_col, ref_col, der_col in standardized_list:
+        print(f"Mapping for {sor_col} with {ref_col} from {ref_table}")
+        start_time = time.time()
+
+        table_query = f"Table == '{ref_table}'"
+        if isinstance(ref_col, str):
+            table_query += f" & ColumnName == '{ref_col}'"
+        table_df = mapping_df.query(table_query)
+
+        if not isinstance(der_col, str):
+            der_col = f"DERIVED_{sor_col}"
+
+        df = osdu_mapping_helper.derive_osdu_mapping_column(
+            df, table_df, sor_col, der_col)
+
+        df = place_column_next_to(df, sor_col, der_col)
+        print(f"Mapping {sor_col} took {time.time() - start_time:.3f}s")
+
+    return df
+
+
+# Reference entity name
+DATA_ENTITY_SCHEMA = {
+    'Allocated Perforation': {
+        'name': 'AllocatedPerforation',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'RBF_CODE': {
+                'display_name': 'Reservoir Code',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Perforation Interval Code',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'Z_PROD_DAYS': {
+                'display_name': 'Production Days',
+                'unit': 'Days',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_PROD_DAYS_GI': {
+                'display_name': 'Gas Injection Days',
+                'unit': 'Days',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_PROD_DAYS_WI': {
+                'display_name': 'Water Injection Days',
+                'unit': 'Days',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_NET_OIL_VOL': {
+                'display_name': 'Allocated Results Net Oil Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_VOL': {
+                'display_name': 'Allocated Results Gas Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_COND_VOL': {
+                'display_name': 'Allocated Results Condensate Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_VOL': {
+                'display_name': 'Allocated Results Water Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_INJ_VOL': {
+                'display_name':
+                'Allocated Results Water Injection Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_INJ_VOL': {
+                'display_name': 'Allocated Results Gas Injection Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Allocated Well (Prod Well)': {
+        'name': 'AllocatedWellProdWell',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'PROD_DAYS': {
+                'display_name': 'Production Days',
+                'unit': 'Days',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_VOL': {
+                'display_name': 'Allocated Results Gas Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_NET_OIL_VOL': {
+                'display_name': 'Allocated Results Net Oil Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_COND_VOL': {
+                'display_name': 'Allocated Results Condensate Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_VOL': {
+                'display_name': 'Allocated Results Water Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GL_VOL': {
+                'display_name': 'Allocated Results Gas Lift Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Allocated Well (Inj Well)': {
+        'name': 'AllocatedWellInjWell',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'INJ_TYPE': {
+                'display_name': 'Injection Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'INJ_DAYS': {
+                'display_name': 'Injection Days',
+                'unit': 'Days',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_INJ_VOL': {
+                'display_name':
+                'Allocated Results Water Injection Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_INJ_VOL': {
+                'display_name': 'Allocated Results Gas Injection Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'INJ_VOL_UOM': {
+                'display_name': 'Injection Volume UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Choke Change': {
+        'name': 'ChokeChange',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'EVENT_TYPE': {
+                'display_name': 'Event Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'Z_WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'PRODUCTION_DAY': {
+                'display_name': 'Production Day',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_PRESS': {
+                'display_name': 'WHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_TEMP': {
+                'display_name': 'WHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BH_PRESS': {
+                'display_name': 'BHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BH_TEMP': {
+                'display_name': 'BHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_OIL_RATE': {
+                'display_name': 'Oil Rate [bbl/d]',
+                'unit': 'BBL/DAY',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Daily Prod Well Status (Oil)': {
+        'name': 'DailyProdWellStatusOil',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'ON_STREAM_HRS': {
+                'display_name': 'On stream Hours',
+                'unit': 'Hour',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_TEMP': {
+                'display_name': 'Well Hole WHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_PRESS': {
+                'display_name': 'Well Hole WHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_TEMP': {
+                'display_name': 'Downhole DHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_PRESS': {
+                'display_name': 'Downhole DHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_GL_MF_PRESS': {
+                'display_name': 'Pressure Choke MF Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_GL_PRESS': {
+                'display_name': 'Pressure Choke WHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ITHP': {
+                'display_name': 'Pressure Injection THP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FTHP': {
+                'display_name': 'Pressure FTHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_STHP': {
+                'display_name': 'Pressure STHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FLP': {
+                'display_name': 'Pressure FLP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FLT': {
+                'display_name': 'FLT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_PCP': {
+                'display_name': 'Pressure PCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ICP': {
+                'display_name': 'Pressure ICP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_SCP': {
+                'display_name': 'Pressure SCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_CCP': {
+                'display_name': 'Pressure CCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_OIL_VOL': {
+                'display_name': 'Allocated Results Oil Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_VOL': {
+                'display_name': 'Allocated Results Gas Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_COND_VOL': {
+                'display_name': 'Allocated Results Condensate Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_VOL': {
+                'display_name': 'Allocated Results Water Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GL_VOL': {
+                'display_name': 'Allocated Results GL Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Daily Prod Well Status (Gas) ': {
+        'name': 'DailyProdWellStatusGas',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'WELL_STATUS': {
+                'display_name': 'Wellstring Status',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'ON_STREAM_HRS': {
+                'display_name': 'On stream Hours',
+                'unit': 'Hour',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_TEMP': {
+                'display_name': 'Well Hole WHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_PRESS': {
+                'display_name': 'Well Hole WHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_TEMP': {
+                'display_name': 'Downhole DHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_PRESS': {
+                'display_name': 'Downhole DHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_GL_MF_PRESS': {
+                'display_name': 'Pressure Choke MF Pressure',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_GL_PRESS': {
+                'display_name': 'Pressure Choke WHP',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ITHP': {
+                'display_name': 'Pressure ITHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FTHP': {
+                'display_name': 'Pressure FTHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FTHT': {
+                'display_name': 'FTHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_STHP': {
+                'display_name': 'Pressure STHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FLP': {
+                'display_name': 'Pressure FLP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FLT': {
+                'display_name': 'FLT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_PCP': {
+                'display_name': 'Pressure PCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ICP': {
+                'display_name': 'Pressure ICP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_SCP': {
+                'display_name': 'Pressure SCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_CCP': {
+                'display_name': 'Pressure CCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_GAS_VOL': {
+                'display_name': 'Allocated Results Gas Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ALLOC_GAS_FACTOR': {
+                'display_name': 'Allocated Results Gas Factor',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_COND_VOL': {
+                'display_name': 'Allocated Results Condensate Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ALLOC_COND_FACTOR': {
+                'display_name': 'Allocated Results Condensate Factor',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_WATER_VOL': {
+                'display_name': 'Allocated Results Water Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Daily Inj Well Status (Gas)': {
+        'name': 'DailyInjWellStatusGas',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'INJ_TYPE': {
+                'display_name': 'Injection Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_STATUS': {
+                'display_name': 'Wellstring Status',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'ON_STREAM_HRS': {
+                'display_name': 'On stream Hours',
+                'unit': 'Hour',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'INJ_RATE': {
+                'display_name': 'Injection Rate [scf/d]',
+                'unit': 'SCF/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_INJ_VOL': {
+                'display_name': 'Allocated Injection Volume [scf]',
+                'unit': 'SCF',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_TEMP': {
+                'display_name': 'Injection THT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_PRESS': {
+                'display_name': 'Injection THP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_TEMP': {
+                'display_name': 'DHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_PRESS': {
+                'display_name': 'DHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ANNULUS_PRESS': {
+                'display_name': 'CHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Daily Inj Well Status (Water)': {
+        'name': 'DailyInjWellStatusWater',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'INJ_TYPE': {
+                'display_name': 'Injection Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_STATUS': {
+                'display_name': 'Wellstring Status',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'ON_STREAM_HRS': {
+                'display_name': 'On stream Hours',
+                'unit': 'Hour',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'INJ_RATE': {
+                'display_name': 'Injection Rate [bbl/d]',
+                'unit': 'BBL/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ALLOC_INJ_VOL': {
+                'display_name': 'Allocated Injection Volume [bbl]',
+                'unit': 'BBL',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_ANNULUS_PRESSURE': {
+                'display_name': 'CHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_TEMP': {
+                'display_name': 'Injection THT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_WH_PRESS': {
+                'display_name': 'Injection THP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_SHUTIN_PRESS': {
+                'display_name': 'Shut in pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FLP': {
+                'display_name': 'FLP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_TEMP': {
+                'display_name': 'DHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_BH_PRESS': {
+                'display_name': 'DHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'FGS -Survey Data': {
+        'name': 'FGSSurveyData',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'RBF_CODE': {
+                'display_name': 'Reservoir Code',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_NO': {
+                'display_name': 'Survey No',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_END_DATE': {
+                'display_name': 'Survey End Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'SURVEY_TYPE': {
+                'display_name': 'Survey Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATA_QUALITY': {
+                'display_name': 'Data Quality',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_MD': {
+                'display_name': 'Gauge MD',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_TVDSS': {
+                'display_name': 'Gauge TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_PRESS': {
+                'display_name': 'Gauge Pressure [PSIG]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_TEMP': {
+                'display_name': 'Gauge Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_DF': {
+                'display_name': 'Depth Reference DF Elevation AMSL [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_THF': {
+                'display_name': 'Depth Reference THF to DF Elevation [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_WATER': {
+                'display_name': 'Depth Reference Water Depth [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_MIDPERF_THF': {
+                'display_name': 'Depth Reference Mid Perf Depth THF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_MDTHF': {
+                'display_name': 'Mid Perf MDTHF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_MD': {
+                'display_name': 'Mid Perf MDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_TVDDF': {
+                'display_name': 'Mid Perf TVDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_TVDSS': {
+                'display_name': 'Mid Perf TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'LAST_SURVEY_DEPTH': {
+                'display_name':
+                'Last Survey Information Last Survey Depth [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'LAST_SURVEY_PRESS': {
+                'display_name':
+                'Last Survey Information Last Survey Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_GRAD': {
+                'display_name':
+                'Last Survey Information Last Survey Gradient [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_PRESS': {
+                'display_name':
+                'Last Survey Information Mid Perf Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATUM_PRESS': {
+                'display_name':
+                'Last Survey Information Datum Pressure [PSIG]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATUM_TVDSS': {
+                'display_name': 'Last Survey Information Datum TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WT_START_DATE': {
+                'display_name': 'Well Test Reference Well Test Start Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'WT_END_DATE': {
+                'display_name': 'Well Test Reference Well Test End Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'LIQUID_RATE': {
+                'display_name': 'Well Test Reference Liquid Rate [bbl/d]',
+                'unit': 'BBL/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'OIL_RATE': {
+                'display_name': 'Well Test Reference Oil Rate [bbl/d]',
+                'unit': 'BBL/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAS_RATE': {
+                'display_name': 'Well Test Reference Gas Rate [scf/d]',
+                'unit': 'SCF/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WATER_RATE': {
+                'display_name': 'Well Test Reference Water Rate [bbl/d]',
+                'unit': 'BBL/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BSW': {
+                'display_name': 'Well Test Reference Watercut [%]',
+                'unit': '%',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GL_LIFT_RATE': {
+                'display_name': 'Well Test Reference Gas Lift Rate [scf/d]',
+                'unit': 'SCF/D',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WT_CHOKE_SIZE': {
+                'display_name': 'Well Test Reference Well Test Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WT_CHOKE_UOM': {
+                'display_name': 'Well Test Reference Well Test Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'THP': {
+                'display_name': 'Well Test Reference THP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHP': {
+                'display_name': 'Well Test Reference CHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'FLP': {
+                'display_name': 'Well Test Reference FLP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_SITHP': {
+                'display_name':
+                'Survey General Information Average SITHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_PCP': {
+                'display_name':
+                'Survey General Information Average PCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'FHTP_START': {
+                'display_name': 'Survey General Information FHTP start [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'FTHP_END': {
+                'display_name': 'Survey General Information FTHP End [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PCP_START': {
+                'display_name': 'Survey General Information PCP Start [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PCP_END': {
+                'display_name': 'Survey General Information PCP End [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TYPE': {
+                'display_name': 'Survey General Information Top Gauge Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_TYPE': {
+                'display_name': 'Survey General Information Bottom Gauge Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_SN': {
+                'display_name': 'Survey General Information Top Gauge S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_SN': {
+                'display_name': 'Survey General Information Bottom Gauge S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_MAX_PRESS': {
+                'display_name':
+                'Survey General Information Top Max Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_MAX_PRESS': {
+                'display_name':
+                'Survey General Information Bottom Max Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_MAX_TEMP': {
+                'display_name':
+                'Survey General Information Top Max Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_MAX_TEMP': {
+                'display_name':
+                'Survey General Information Bottom Max Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_BAT_SN': {
+                'display_name': 'Survey General Information Top Battery S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_BAT_SN': {
+                'display_name':
+                'Survey General Information Bottom Battery S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'FGS - Process Data': {
+        'name': 'FGSProcessData',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_NO': {
+                'display_name': 'Survey No',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': False,
+                'is_key': True
+            },
+            'STOPS': {
+                'display_name': 'Stops',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'POINT': {
+                'display_name': 'Point',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': True
+            },
+            'MDWLTHF': {
+                'display_name': 'Mid Perf MDWLTHF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MD': {
+                'display_name': 'Mid Perf MDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TVDDF': {
+                'display_name': 'Mid Perf TVDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TVDSS': {
+                'display_name': 'Mid Perf TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_PRESS': {
+                'display_name': 'Top Gauge Top Gauge Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TEMP': {
+                'display_name': 'Top Gauge Top Gauge Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_PRESS_GRAD': {
+                'display_name':
+                'Top Gauge Top Gauge Pressure Gradient [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TEMP_GRAD': {
+                'display_name':
+                'Top Gauge Top Gauge Temperature Gradient [F/ft]',
+                'unit': 'F/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS': {
+                'display_name': 'Pressure (L.E) [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_FORMATTED': {
+                'display_name': 'Pressure Formatted [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP': {
+                'display_name': 'Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP_FORMATTED': {
+                'display_name': 'Temperature Formatted [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_GRAD': {
+                'display_name': 'Pressure Gradient (L.E) [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP_GRAD': {
+                'display_name': 'Temperature Gradient [F/ft]',
+                'unit': 'F/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'SURVEY_TYPE': {
+                'display_name': 'Survey Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'NEGATIVE_MD': {
+                'display_name': 'Negative MD',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'SGS -Survey Data': {
+        'name': 'SGSSurveyData',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'RBF_CODE': {
+                'display_name': 'Reservoir Code',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'DAYTIME': {
+                'display_name': 'Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_NO': {
+                'display_name': 'Survey No',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_END_DATE': {
+                'display_name': 'Survey End Date',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'SURVEY_TYPE': {
+                'display_name': 'Survey Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATA_QUALITY': {
+                'display_name': 'Data Quality',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_MD': {
+                'display_name': 'Gauge MD',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_TVDSS': {
+                'display_name': 'Gauge TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_PRESS': {
+                'display_name': 'Gauge Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAUGE_TEMP': {
+                'display_name': 'Gauge Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_DF': {
+                'display_name': 'Depth Reference DF Elevation AMSL [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_THF': {
+                'display_name': 'Depth Reference THF to DF Elevation [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_WATER': {
+                'display_name': 'Depth Reference Water Depth [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_MIDPERF_THF': {
+                'display_name': 'Depth Reference Mid Perf Depth THF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DEPTH_SURVEY_GRAD': {
+                'display_name': 'Depth Reference Survey Gradient [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_MDTHF': {
+                'display_name': 'Mid Perf MDTHF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_MD': {
+                'display_name': 'Mid Perf MDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_TVDDF': {
+                'display_name': 'Mid Perf TVDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_TVDSS': {
+                'display_name': 'Mid Perf TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'LAST_SURVEY_DEPTH': {
+                'display_name':
+                'Last Survey Information Last Survey Depth [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'LAST_SURVEY_PRESS': {
+                'display_name':
+                'Last Survey Information Last Survey Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_GRAD': {
+                'display_name':
+                'Last Survey Information Pressure Gradient [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'MIDPERF_PRESS': {
+                'display_name':
+                'Last Survey Information Mid Perf Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATUM_PRESS': {
+                'display_name': 'Datum Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'DATUM_TVDSS': {
+                'display_name': 'Datum TVDSS [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'THP': {
+                'display_name': 'THP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHP': {
+                'display_name': 'CHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_SITHP': {
+                'display_name':
+                'Survey General Information Average SITHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'AVG_PCP': {
+                'display_name':
+                'Survey General Information Average PCP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'FHTP_START': {
+                'display_name': 'Survey General Information FHTP start [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'FTHP_END': {
+                'display_name': 'Survey General Information FTHP End [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PCP_START': {
+                'display_name': 'Survey General Information PCP Start [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PCP_END': {
+                'display_name': 'Survey General Information PCP End [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TYPE': {
+                'display_name': 'Survey General Information Top Gauge Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_TYPE': {
+                'display_name': 'Survey General Information Bottom Gauge Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_SN': {
+                'display_name': 'Survey General Information Top Gauge S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_SN': {
+                'display_name': 'Survey General Information Bottom Gauge S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_MAX_PRESS': {
+                'display_name':
+                'Survey General Information Top Max Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_MAX_PRESS': {
+                'display_name':
+                'Survey General Information Bottom Max Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_MAX_TEMP': {
+                'display_name':
+                'Survey General Information Top Max Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_MAX_TEMP': {
+                'display_name':
+                'Survey General Information Bottom Max Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_BAT_SN': {
+                'display_name': 'Survey General Information Top Battery S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'BOTTOM_GAUGE_BAT_SN': {
+                'display_name':
+                'Survey General Information Bottom Battery S/N',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'SGS - Process Data': {
+        'name': 'SGSProcessData',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'SURVEY_NO': {
+                'display_name': 'Survey No',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': False,
+                'is_key': True
+            },
+            'STOPS': {
+                'display_name': 'Stops',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'POINT': {
+                'display_name': 'Point',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': True
+            },
+            'MD': {
+                'display_name': 'MDDF (L.E) [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TVDDF': {
+                'display_name': 'TVDDF [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TVDSS': {
+                'display_name': 'TVDSS (L.E) [ft]',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_PRESS': {
+                'display_name': 'Top Gauge Top Gauge Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TEMP': {
+                'display_name': 'Top Gauge Top Gauge Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_PRESS_GRAD': {
+                'display_name':
+                'Top Gauge Top Gauge Pressure Gradient [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOP_GAUGE_TEMP_GRAD': {
+                'display_name':
+                'Top Gauge Top Gauge Temperature Gradient [F/ft]',
+                'unit': 'F/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS': {
+                'display_name': 'Pressure (L.E) [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_FORMATTED': {
+                'display_name': 'Pressure Formatted [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP': {
+                'display_name': 'Temperature [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP_FORMATTED': {
+                'display_name': 'Temperature Formatted [F]',
+                'unit': 'F',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRESS_GRAD': {
+                'display_name': 'Pressure Gradient (L.E) [psi/ft]',
+                'unit': 'psi/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEMP_GRAD': {
+                'display_name': 'Temperature Gradient [F/ft]',
+                'unit': 'F/ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'SURVEY_TYPE': {
+                'display_name': 'Survey Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'NEGATIVE_MD': {
+                'display_name': 'Negative MD',
+                'unit': 'ft',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    },
+    'Well Test': {
+        'name': 'WellTest',
+        'columns': {
+            'COUNTRY': {
+                'display_name': 'Country',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'REGION': {
+                'display_name': 'Region',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'FIELD': {
+                'display_name': 'Field',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELL_NAME': {
+                'display_name': 'Well Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'WELLBORE_NAME': {
+                'display_name': 'Wellbore Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'Z_WELL_TYPE': {
+                'display_name': 'Wellbore Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': False
+            },
+            'OBJECT_CODE': {
+                'display_name': 'Wellstring Name',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': False,
+                'is_key': True
+            },
+            'START_DATE': {
+                'display_name': 'Start Date/Time',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': False,
+                'is_key': True
+            },
+            'WELL_TEST_TYPE': {
+                'display_name': 'Well Test Type',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'END_DATE': {
+                'display_name': 'End Date/Time',
+                'unit': 'DD/MM/YYYY',
+                'datatype': 'DATE',
+                'nullable': True,
+                'is_key': False
+            },
+            'TEST_DURATION': {
+                'display_name': 'Test Duration [h]',
+                'unit': 'Hour',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'VALIDATE_RESULT': {
+                'display_name': 'Status',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'USE_CALC_IND': {
+                'display_name': 'Use In Allocation',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'PRIMARY_IND': {
+                'display_name': 'Primary Ind',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'FLOWING_IND': {
+                'display_name': 'Flowing Ind',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'CHOKE_SIZE': {
+                'display_name': 'Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': True
+            },
+            'CHOKE_UOM': {
+                'display_name': 'Choke UoM',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_SEP_PRESS': {
+                'display_name': 'Separator Separator Pressure [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_SEP_TEMP': {
+                'display_name': 'Separator Separator Temperature [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_PRESS': {
+                'display_name': 'Well Head WHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_TEMP': {
+                'display_name': 'Well Head WHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ANNULUS_PRESS': {
+                'display_name': 'Well Head CHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'ANNULUS_TEMP': {
+                'display_name': 'Well Head CHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_USC_PRESS': {
+                'display_name': 'Well Head FTHP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_USC_TEMP': {
+                'display_name': 'Well Head FTHT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_DSC_PRESS': {
+                'display_name': 'Well Head FLP [psig]',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WH_DSC_TEMP': {
+                'display_name': 'Well Head FLT [C]',
+                'unit': 'C',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_GL_STATUS': {
+                'display_name': 'Gas Lift GL Status',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_TOTAL_GLR': {
+                'display_name': 'Gas Lift Total GL Rate [scf/d]',
+                'unit': 'scf/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_GL_FACTOR': {
+                'display_name': 'Gas Lift String Split Factor',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GL_RATE': {
+                'display_name': 'Gas Lift Gas Lift Rate [scf/d]',
+                'unit': 'scf/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ORIFICE_SIZE_GL': {
+                'display_name': 'Gas Lift GL Orifice Size [in]',
+                'unit': 'inch',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'RATE_SOURCE': {
+                'display_name': 'Gas Lift Rate Source',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_TOTAL_GAS': {
+                'display_name': 'Gas Lift Total Gas [scf/d]',
+                'unit': 'scf/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GL_CHOKE_SIZE': {
+                'display_name': 'Gas Lift Gas Lift Choke Size',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GL_PRESS': {
+                'display_name': 'Gas Lift Gas Lift Pressure',
+                'unit': 'PSIG',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_GAS_RATE': {
+                'display_name':
+                'Net Process Adjusted Volume Results Formation Gas Rate [scf/d]',
+                'unit': 'scf/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_ORIFICE_SIZE_GAS': {
+                'display_name':
+                'Net Process Adjusted Volume Results Orifice Size [in]',
+                'unit': 'Inch',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'TOT_WATER_RATE_ADJ': {
+                'display_name':
+                'Net Process Adjusted Volume Results Adjusted Total Water Rate [bbl/d]',
+                'unit': 'bbl/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'NET_COND_RATE_ADJ': {
+                'display_name':
+                'Net Process Adjusted Volume Results Adjusted Net Condensate Rate [bbl/d]',
+                'unit': 'bbl/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GAS_RATE_ADJ': {
+                'display_name':
+                'Net Process Adjusted Volume Results Adjusted Gas Rate scf/d]',
+                'unit': 'scf/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'NET_OIL_RATE_ADJ': {
+                'display_name':
+                'Net Process Adjusted Volume Results Adjusted Net Oil Rate [bbl/d]',
+                'unit': 'bbl/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'LIQUID_RATE_ADJ': {
+                'display_name':
+                'Net Process Adjusted Volume Results Adjusted Liquid Rate [bbl/d]',
+                'unit': 'bbl/d',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GOR': {
+                'display_name': 'Oil Factors GOR',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_FGOR': {
+                'display_name': 'Oil Factors FGOR [scf/bbl]',
+                'unit': 'scf/bbl',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WOR': {
+                'display_name': 'Oil Factors WOR',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_IGLR': {
+                'display_name': 'Oil Factors IGLR [scf/bbl]',
+                'unit': 'scf/bbl',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'GLR': {
+                'display_name': 'Oil Factors GLR',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_TGLR': {
+                'display_name': 'Oil Factors TGLR [scf/bbl]',
+                'unit': 'scf/bbl',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'Z_GUF': {
+                'display_name': 'Oil Factors GUF [bbl/MMscf]',
+                'unit': 'bbl/MMscf',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WATERCUT_PCT': {
+                'display_name': 'Oil Factors Watercut [%]',
+                'unit': 'bbl/scf',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'WGR': {
+                'display_name': 'Gas Factors WGR [bbl/scf]',
+                'unit': 'bbl/scf',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'CGR': {
+                'display_name': 'Gas Factors CGR [bbl/scf]',
+                'unit': 'bbl/scf',
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'RESULT_NO': {
+                'display_name': 'Result No',
+                'unit': None,
+                'datatype': 'NUMBER',
+                'nullable': True,
+                'is_key': False
+            },
+            'COMMENTS': {
+                'display_name': 'Comments',
+                'unit': None,
+                'datatype': 'STRING',
+                'nullable': True,
+                'is_key': False
+            }
+        }
+    }
+}
